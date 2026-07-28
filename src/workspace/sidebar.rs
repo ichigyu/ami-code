@@ -529,7 +529,11 @@ impl Sidebar {
                 self.pending_loads.insert(path.to_path_buf(), id);
                 true
             }
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+            Err(TrySendError::Full(_)) => false,
+            Err(TrySendError::Disconnected(_)) => {
+                self.git_error = Some("sidebar worker is unavailable".to_owned());
+                true
+            }
         }
     }
 
