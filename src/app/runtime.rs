@@ -43,6 +43,7 @@ const MOUSE_WHEEL_LINES: i32 = 3;
 const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
 const EDGE_SCROLL_LINES: i32 = 1;
 const TRUST_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const SIDEBAR_DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
 
 pub fn run(mode: LaunchMode) -> Result<()> {
     let workspace = Workspace::discover(std::env::current_dir()?)?;
@@ -769,6 +770,7 @@ struct AppRuntime {
     status: Option<String>,
     viewport_area: Rect,
     pending_mouse: Option<PendingMouseGesture>,
+    last_sidebar_click: Option<(std::path::PathBuf, Instant)>,
     pending_layout: Option<PendingLayoutGesture>,
     context_menu: Option<ContextMenuState>,
     layout_store: Option<LayoutStore>,
@@ -872,6 +874,7 @@ impl AppRuntime {
             status,
             viewport_area: area,
             pending_mouse: None,
+            last_sidebar_click: None,
             pending_layout: None,
             context_menu: None,
             layout_store,
@@ -1165,6 +1168,11 @@ impl AppRuntime {
                 } else {
                     PaneId::Editor
                 };
+                if pane == PaneId::Sidebar && key.code == KeyCode::Enter {
+                    self.last_sidebar_click = None;
+                    self.activate_sidebar_selection();
+                    return Ok(true);
+                }
                 let now = Instant::now();
                 if !self
                     .sessions
@@ -1247,6 +1255,7 @@ impl AppRuntime {
         }
         if event.kind == MouseEventKind::Down(MouseButton::Right) {
             self.pending_mouse = None;
+            self.last_sidebar_click = None;
             self.cancel_layout_gesture();
             self.context_menu = None;
             if let Some(MouseTarget::Content { pane, .. }) =
@@ -1306,6 +1315,9 @@ impl AppRuntime {
                 let Some(target) = target else {
                     return Ok(());
                 };
+                if !matches!(target, MouseTarget::Sidebar { .. }) {
+                    self.last_sidebar_click = None;
+                }
                 match target {
                     MouseTarget::Handle(handle) => {
                         self.pending_mouse = None;
@@ -1496,6 +1508,7 @@ impl AppRuntime {
             if let Some(row) = activated_sidebar_row(pending, release) {
                 let trust = self.sidebar_trust_chrome();
                 if let Some(target) = sidebar_trust_hit(trust, row) {
+                    self.last_sidebar_click = None;
                     self.activate_trust_target(target);
                     return Ok(());
                 }
@@ -1504,16 +1517,21 @@ impl AppRuntime {
                     .map(|layout| sidebar_tree_viewport_rows(layout.sidebar, trust))
                     .unwrap_or(0);
                 let tree_row = row.saturating_sub(sidebar_trust_rows(trust));
-                let activation = self
+                let selected = self
                     .sidebar
                     .as_mut()
-                    .and_then(|sidebar| sidebar.click_visible_row(tree_row, viewport_rows));
-                if let Some(SidebarActivation::OpenFile(path)) = activation {
-                    apply_sidebar_open_result(
-                        &mut self.workbench,
-                        &mut self.status,
-                        self.sessions.open_editor_file(&path),
-                    );
+                    .and_then(|sidebar| sidebar.select_visible_row(tree_row, viewport_rows));
+                if let Some(path) = selected {
+                    let now = Instant::now();
+                    let activate =
+                        is_sidebar_double_click(self.last_sidebar_click.as_ref(), &path, now);
+                    self.last_sidebar_click = Some((path, now));
+                    if activate {
+                        self.last_sidebar_click = None;
+                        self.activate_sidebar_selection();
+                    }
+                } else {
+                    self.last_sidebar_click = None;
                 }
             }
             return Ok(());
@@ -1546,6 +1564,17 @@ impl AppRuntime {
             now,
         )?;
         Ok(())
+    }
+
+    fn activate_sidebar_selection(&mut self) {
+        let activation = self.sidebar.as_mut().and_then(Sidebar::activate_selected);
+        if let Some(SidebarActivation::OpenFile(path)) = activation {
+            apply_sidebar_open_result(
+                &mut self.workbench,
+                &mut self.status,
+                self.sessions.open_editor_file(&path),
+            );
+        }
     }
 
     fn forward_mouse_motion(
@@ -1995,6 +2024,17 @@ fn sidebar_viewport_rows(area: Rect) -> usize {
 
 fn sidebar_tree_viewport_rows(area: Rect, trust: SidebarTrustChrome) -> usize {
     sidebar_viewport_rows(area).saturating_sub(sidebar_trust_rows(trust))
+}
+
+fn is_sidebar_double_click(
+    previous: Option<&(std::path::PathBuf, Instant)>,
+    path: &std::path::Path,
+    now: Instant,
+) -> bool {
+    previous.is_some_and(|(previous_path, clicked_at)| {
+        previous_path == path
+            && now.saturating_duration_since(*clicked_at) <= SIDEBAR_DOUBLE_CLICK_INTERVAL
+    })
 }
 
 fn activated_sidebar_row(pending: PendingMouseGesture, release: MouseEvent) -> Option<usize> {
@@ -2506,6 +2546,29 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn sidebar_double_click_requires_same_path_within_interval() {
+        let now = Instant::now();
+        let path = std::path::PathBuf::from("src/main.rs");
+        let previous = (path.clone(), now);
+        assert!(is_sidebar_double_click(
+            Some(&previous),
+            &path,
+            now + Duration::from_millis(399)
+        ));
+        assert!(!is_sidebar_double_click(
+            Some(&previous),
+            std::path::Path::new("src/lib.rs"),
+            now + Duration::from_millis(20)
+        ));
+        assert!(!is_sidebar_double_click(
+            Some(&previous),
+            &path,
+            now + Duration::from_millis(401)
+        ));
+        assert!(!is_sidebar_double_click(None, &path, now));
     }
 
     #[test]

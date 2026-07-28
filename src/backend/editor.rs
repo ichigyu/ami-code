@@ -231,7 +231,7 @@ impl NvimController {
         spec.args = vec![
             "--server".into(),
             endpoint_arg.to_owned(),
-            "--remote".into(),
+            "--remote-tab-silent".into(),
             absolute_arg.to_owned(),
         ];
         spec.cwd = Some(self.workspace_root.clone());
@@ -739,12 +739,40 @@ mod tests {
             generation.endpoint().exists(),
             "Nvim listen socket was not ready"
         );
-        let opened = root.join("new file ü.txt");
-        fs::write(&opened, b"").unwrap();
-        generation
-            .controller(&workspace)
-            .open_existing_file(&opened)
+        let first = root.join("first file ü.txt");
+        let second = root.join("second.rs");
+        fs::write(&first, b"").unwrap();
+        fs::write(&second, b"").unwrap();
+        let controller = generation.controller(&workspace);
+        controller.open_existing_file(&first).unwrap();
+        controller.open_existing_file(&second).unwrap();
+        controller.open_existing_file(&first).unwrap();
+
+        let tabs = Command::new("nvim")
+            .args([
+                "--server",
+                generation.endpoint().to_str().unwrap(),
+                "--remote-expr",
+                "tabpagenr('$')",
+            ])
+            .output()
             .unwrap();
+        assert!(tabs.status.success());
+        assert_eq!(String::from_utf8_lossy(&tabs.stdout).trim(), "2");
+        let current = Command::new("nvim")
+            .args([
+                "--server",
+                generation.endpoint().to_str().unwrap(),
+                "--remote-expr",
+                "expand('%:p')",
+            ])
+            .output()
+            .unwrap();
+        assert!(current.status.success());
+        assert_eq!(
+            Path::new(String::from_utf8_lossy(&current.stdout).trim()),
+            first.canonicalize().unwrap()
+        );
         let status = Command::new("nvim")
             .args([
                 "--server",

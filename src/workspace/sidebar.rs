@@ -552,16 +552,8 @@ impl Sidebar {
         self.flatten_rows()
     }
 
-    /// Selects a row relative to the current viewport and toggles directories.
-    ///
-    /// Only file and error-free symlink rows produce an open activation. The
-    /// controller performs the authoritative, synchronous filesystem check at
-    /// activation time, so a row deleted or replaced after loading is rejected.
-    pub fn click_visible_row(
-        &mut self,
-        row: usize,
-        viewport_rows: usize,
-    ) -> Option<SidebarActivation> {
+    /// Selects a row relative to the current viewport without activating it.
+    pub fn select_visible_row(&mut self, row: usize, viewport_rows: usize) -> Option<PathBuf> {
         if row >= viewport_rows {
             return None;
         }
@@ -571,6 +563,12 @@ impl Sidebar {
             .path
             .clone();
         self.selected = Some(path.clone());
+        Some(path)
+    }
+
+    /// Opens the selected file or toggles the selected directory.
+    pub fn activate_selected(&mut self) -> Option<SidebarActivation> {
+        let path = self.selected.clone()?;
         let node = self.nodes.get(&path)?;
         let directory = node.kind.is_directory();
         let open_file =
@@ -1356,7 +1354,11 @@ mod tests {
         assert!(!rows.iter().any(|row| row.name == OsStr::new(".git")));
         assert!(rows[0].error.as_deref().unwrap().contains("entry cap"));
         assert_eq!(
-            sidebar.click_visible_row(1, rows.len()),
+            sidebar.select_visible_row(1, rows.len()),
+            Some(root.join("z-dir"))
+        );
+        assert_eq!(
+            sidebar.activate_selected(),
             Some(SidebarActivation::SelectOnly)
         );
         assert_eq!(sidebar.selected_path(), Some(root.join("z-dir").as_path()));
@@ -1382,14 +1384,22 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            sidebar.click_visible_row(directory, rows.len()),
+            sidebar.select_visible_row(directory, rows.len()),
+            Some(root.join("dir"))
+        );
+        assert_eq!(
+            sidebar.activate_selected(),
             Some(SidebarActivation::SelectOnly)
         );
         assert_eq!(
-            sidebar.click_visible_row(file, rows.len()),
+            sidebar.select_visible_row(file, rows.len()),
+            Some(root.join("file"))
+        );
+        assert_eq!(
+            sidebar.activate_selected(),
             Some(SidebarActivation::OpenFile(root.join("file")))
         );
-        assert_eq!(sidebar.click_visible_row(rows.len(), rows.len()), None);
+        assert_eq!(sidebar.select_visible_row(rows.len(), rows.len()), None);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1571,7 +1581,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict\0\
             .iter()
             .position(|row| row.path == root.join("c"))
             .unwrap();
-        sidebar.click_visible_row(selected_row.saturating_sub(sidebar.scroll), 2);
+        sidebar.select_visible_row(selected_row.saturating_sub(sidebar.scroll), 2);
 
         fs::write(root.join("0"), b"").unwrap();
         wait_until(&mut sidebar, |sidebar| {
