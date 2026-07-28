@@ -14,17 +14,22 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+
 /// Default maximum number of children loaded from one directory.
 pub const DEFAULT_ENTRY_CAP: usize = 10_000;
 const GIT_OUTPUT_CAP_BYTES: usize = 4 * 1024 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const WATCH_CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct SidebarConfig {
     pub entry_cap: usize,
     pub channel_capacity: usize,
     pub git_refresh_interval: Duration,
+    pub fs_debounce_interval: Duration,
+    pub fs_reconcile_interval: Duration,
 }
 
 impl Default for SidebarConfig {
@@ -33,6 +38,8 @@ impl Default for SidebarConfig {
             entry_cap: DEFAULT_ENTRY_CAP,
             channel_capacity: 8,
             git_refresh_interval: Duration::from_secs(3),
+            fs_debounce_interval: Duration::from_millis(150),
+            fs_reconcile_interval: Duration::from_secs(5),
         }
     }
 }
@@ -164,6 +171,11 @@ enum Response {
     },
 }
 
+enum WatchSignal {
+    Paths(Vec<PathBuf>),
+    Rescan,
+}
+
 struct LoadedDirectory {
     canonical: PathBuf,
     entries: Vec<LoadedEntry>,
@@ -220,6 +232,12 @@ pub struct Sidebar {
     last_git_request: Instant,
     git_error: Option<String>,
     git_changes: Vec<GitChange>,
+    _watcher: Option<RecommendedWatcher>,
+    watch_events: Receiver<WatchSignal>,
+    dirty_dirs: HashSet<PathBuf>,
+    watch_dirty_since: Option<Instant>,
+    reload_after_pending: HashSet<PathBuf>,
+    next_fs_reconcile: Instant,
 }
 
 impl Sidebar {
@@ -262,6 +280,35 @@ impl Sidebar {
             .name("sidebar-worker".into())
             .spawn(move || worker(job_rx, response_tx))?;
 
+        let (watch_tx, watch_rx) = mpsc::sync_channel(WATCH_CHANNEL_CAPACITY);
+        let ignored_git = root.join(".git");
+        let mut watcher =
+            notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+                let signal = match result {
+                    Ok(event) => {
+                        let paths = event
+                            .paths
+                            .into_iter()
+                            .filter(|path| !path.starts_with(&ignored_git))
+                            .collect::<Vec<_>>();
+                        if paths.is_empty() {
+                            return;
+                        }
+                        WatchSignal::Paths(paths)
+                    }
+                    Err(_) => WatchSignal::Rescan,
+                };
+                let _ = watch_tx.try_send(signal);
+            })
+            .ok();
+        if let Some(active) = &mut watcher
+            && active.watch(&root, RecursiveMode::Recursive).is_err()
+        {
+            watcher = None;
+        }
+        let now = Instant::now();
+        let next_fs_reconcile = now + config.fs_reconcile_interval;
+
         Ok(Self {
             root,
             config,
@@ -274,9 +321,15 @@ impl Sidebar {
             pending_loads: HashMap::new(),
             pending_git: None,
             git_refresh_due: false,
-            last_git_request: Instant::now(),
+            last_git_request: now,
             git_error: None,
             git_changes: Vec::new(),
+            _watcher: watcher,
+            watch_events: watch_rx,
+            dirty_dirs: HashSet::new(),
+            watch_dirty_since: None,
+            reload_after_pending: HashSet::new(),
+            next_fs_reconcile,
         })
     }
 
@@ -366,12 +419,26 @@ impl Sidebar {
         }
     }
 
-    /// Applies all currently available worker replies and schedules periodic Git
-    /// refreshes. Returns `true` if model state changed.
+    /// Applies worker replies, filesystem changes, and periodic refreshes.
+    /// Returns `true` if model state changed.
     pub fn tick(&mut self) -> bool {
+        let now = Instant::now();
         let mut changed = false;
         while let Ok(response) = self.responses.try_recv() {
             changed |= self.apply_response(response);
+        }
+        self.collect_watch_events(now);
+        if self
+            .watch_dirty_since
+            .is_some_and(|since| now.duration_since(since) >= self.config.fs_debounce_interval)
+        {
+            self.watch_dirty_since = None;
+            self.schedule_dirty_reloads();
+        }
+        if now >= self.next_fs_reconcile {
+            self.next_fs_reconcile = now + self.config.fs_reconcile_interval;
+            self.queue_all_loaded_dirs();
+            self.schedule_dirty_reloads();
         }
         if self.pending_git.is_none()
             && (self.git_refresh_due
@@ -380,6 +447,94 @@ impl Sidebar {
             self.request_git_refresh();
         }
         changed
+    }
+
+    fn collect_watch_events(&mut self, now: Instant) {
+        let mut saw_event = false;
+        while let Ok(signal) = self.watch_events.try_recv() {
+            saw_event = true;
+            match signal {
+                WatchSignal::Paths(paths) => {
+                    for path in paths {
+                        self.mark_affected_directory(&path);
+                    }
+                }
+                WatchSignal::Rescan => self.queue_all_loaded_dirs(),
+            }
+        }
+        if saw_event {
+            self.watch_dirty_since = Some(now);
+        }
+    }
+
+    fn mark_affected_directory(&mut self, path: &Path) {
+        let candidate = if path == self.root {
+            self.root.as_path()
+        } else {
+            path.parent().unwrap_or(&self.root)
+        };
+        let mut cursor = Some(candidate);
+        while let Some(path) = cursor {
+            if self.nodes.get(path).is_some_and(|node| node.loaded) {
+                self.dirty_dirs.insert(path.to_path_buf());
+                return;
+            }
+            if path == self.root {
+                break;
+            }
+            cursor = path.parent();
+        }
+        if self.nodes.get(&self.root).is_some_and(|node| node.loaded) {
+            self.dirty_dirs.insert(self.root.clone());
+        }
+    }
+
+    fn queue_all_loaded_dirs(&mut self) {
+        self.dirty_dirs.extend(
+            self.nodes
+                .iter()
+                .filter(|(_, node)| node.loaded && node.kind.is_directory())
+                .map(|(path, _)| path.clone()),
+        );
+    }
+
+    fn schedule_dirty_reloads(&mut self) {
+        let dirty = std::mem::take(&mut self.dirty_dirs);
+        for path in dirty {
+            if self.pending_loads.contains_key(&path) {
+                self.reload_after_pending.insert(path);
+            } else if !self.request_reload(&path) {
+                self.dirty_dirs.insert(path);
+            }
+        }
+    }
+
+    fn request_reload(&mut self, path: &Path) -> bool {
+        let Some(node) = self.nodes.get(path) else {
+            return true;
+        };
+        if !node.loaded || !node.kind.is_directory() {
+            return true;
+        }
+        let id = self.take_id();
+        let job = Job::Load {
+            id,
+            path: path.to_path_buf(),
+            root: self.root.clone(),
+            ancestor_targets: self.ancestor_targets(path),
+            cap: self.config.entry_cap,
+        };
+        match self.jobs.try_send(job) {
+            Ok(()) => {
+                self.pending_loads.insert(path.to_path_buf(), id);
+                true
+            }
+            Err(TrySendError::Full(_)) => false,
+            Err(TrySendError::Disconnected(_)) => {
+                self.git_error = Some("sidebar worker is unavailable".to_owned());
+                true
+            }
+        }
     }
 
     /// Rows after expansion and scroll are applied, limited to `viewport_rows`.
@@ -483,14 +638,20 @@ impl Sidebar {
                     return false;
                 }
                 self.pending_loads.remove(&path);
+                let top_path = self
+                    .flatten_rows()
+                    .get(self.scroll)
+                    .map(|row| row.path.clone());
+                let previous_scroll = self.scroll;
                 let Some(parent) = self.nodes.get_mut(&path) else {
                     return false;
                 };
+                let was_loaded = parent.loaded;
                 parent.loading = false;
                 match result {
                     Err(error) => {
                         parent.error = Some(error);
-                        parent.loaded = false;
+                        parent.loaded = was_loaded;
                     }
                     Ok(loaded) => {
                         parent.loaded = true;
@@ -513,16 +674,27 @@ impl Sidebar {
                         for entry in loaded.entries {
                             children.push(entry.path.clone());
                             let old = self.nodes.remove(&entry.path);
+                            let preserve_children = old.as_ref().is_some_and(|node| {
+                                node.kind.is_directory()
+                                    && entry.kind.is_directory()
+                                    && node.canonical_dir == entry.canonical_dir
+                            });
                             self.nodes.insert(
                                 entry.path,
                                 Node {
                                     name: entry.name,
                                     kind: entry.kind,
-                                    expanded: old.as_ref().is_some_and(|n| n.expanded),
+                                    expanded: preserve_children
+                                        && old.as_ref().is_some_and(|node| node.expanded),
                                     loading: false,
-                                    loaded: old.as_ref().is_some_and(|n| n.loaded),
+                                    loaded: preserve_children
+                                        && old.as_ref().is_some_and(|node| node.loaded),
                                     error: entry.error,
-                                    children: old.map_or_else(Vec::new, |n| n.children),
+                                    children: if preserve_children {
+                                        old.map_or_else(Vec::new, |node| node.children)
+                                    } else {
+                                        Vec::new()
+                                    },
                                     canonical_dir: entry.canonical_dir,
                                     synthetic_deleted: false,
                                     git: GitDecoration::default(),
@@ -535,6 +707,15 @@ impl Sidebar {
                     }
                 }
                 self.reconcile_git();
+                self.restore_selection();
+                let rows = self.flatten_rows();
+                self.scroll = top_path
+                    .and_then(|top| rows.iter().position(|row| row.path == top))
+                    .unwrap_or_else(|| previous_scroll.min(rows.len().saturating_sub(1)));
+                if self.reload_after_pending.remove(&path) {
+                    self.dirty_dirs.insert(path);
+                    self.schedule_dirty_reloads();
+                }
                 true
             }
             Response::Git { id, result } => {
@@ -556,6 +737,24 @@ impl Sidebar {
                 true
             }
         }
+    }
+
+    fn restore_selection(&mut self) {
+        let Some(selected) = self.selected.clone() else {
+            return;
+        };
+        if self.nodes.contains_key(&selected) {
+            return;
+        }
+        let mut cursor = selected.parent();
+        while let Some(path) = cursor {
+            if self.nodes.contains_key(path) {
+                self.selected = Some(path.to_path_buf());
+                return;
+            }
+            cursor = path.parent();
+        }
+        self.selected = Some(self.root.clone());
     }
 
     fn remove_subtree(&mut self, path: &Path) {
@@ -1307,6 +1506,150 @@ u UU N... 100644 100644 100644 100644 a b c conflict\0\
         let rows = sidebar.all_visible_rows();
         assert!(rows[0].git.dirty_descendant);
         assert!(rows.iter().any(|row| row.kind == EntryKind::Deleted));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn wait_until(sidebar: &mut Sidebar, mut predicate: impl FnMut(&Sidebar) -> bool) {
+        for _ in 0..400 {
+            sidebar.tick();
+            if predicate(sidebar) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("sidebar did not reach expected state");
+    }
+
+    fn fast_refresh_config() -> SidebarConfig {
+        SidebarConfig {
+            git_refresh_interval: Duration::from_secs(60),
+            fs_debounce_interval: Duration::from_millis(20),
+            fs_reconcile_interval: Duration::from_millis(100),
+            ..SidebarConfig::default()
+        }
+    }
+
+    #[test]
+    fn watcher_refreshes_loaded_directories_and_preserves_hidden_entries() {
+        let root = temp_dir("watch-refresh");
+        fs::write(root.join("old"), b"").unwrap();
+        fs::write(root.join(".hidden"), b"").unwrap();
+        fs::create_dir(root.join(".git")).unwrap();
+        let mut sidebar = Sidebar::with_config(&root, fast_refresh_config()).unwrap();
+        sidebar.request_expand(&root);
+        wait_until(&mut sidebar, |sidebar| {
+            sidebar.nodes.get(&root).is_some_and(|node| node.loaded)
+        });
+
+        fs::rename(root.join("old"), root.join("new")).unwrap();
+        wait_until(&mut sidebar, |sidebar| {
+            let rows = sidebar.all_visible_rows();
+            rows.iter().any(|row| row.path == root.join("new"))
+                && !rows.iter().any(|row| row.path == root.join("old"))
+        });
+        let rows = sidebar.all_visible_rows();
+        assert!(rows.iter().any(|row| row.path == root.join(".hidden")));
+        assert!(!rows.iter().any(|row| row.path == root.join(".git")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reconciliation_restores_selection_and_viewport_anchor() {
+        let root = temp_dir("watch-state");
+        for name in ["a", "b", "c", "d"] {
+            fs::write(root.join(name), b"").unwrap();
+        }
+        let mut sidebar = Sidebar::with_config(&root, fast_refresh_config()).unwrap();
+        sidebar.request_expand(&root);
+        wait_until(&mut sidebar, |sidebar| {
+            sidebar.nodes.get(&root).is_some_and(|node| node.loaded)
+        });
+        sidebar.scroll(2, 2);
+        let top = sidebar.visible_rows(2)[0].path.clone();
+        let selected_row = sidebar
+            .all_visible_rows()
+            .iter()
+            .position(|row| row.path == root.join("c"))
+            .unwrap();
+        sidebar.click_visible_row(selected_row.saturating_sub(sidebar.scroll), 2);
+
+        fs::write(root.join("0"), b"").unwrap();
+        wait_until(&mut sidebar, |sidebar| {
+            sidebar.nodes.contains_key(&root.join("0"))
+        });
+        assert_eq!(sidebar.visible_rows(2)[0].path, top);
+        assert_eq!(sidebar.selected_path(), Some(root.join("c").as_path()));
+
+        fs::remove_file(root.join("c")).unwrap();
+        wait_until(&mut sidebar, |sidebar| {
+            !sidebar.nodes.contains_key(&root.join("c"))
+        });
+        assert_eq!(sidebar.selected_path(), Some(root.as_path()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn watcher_removes_a_deleted_loaded_directory_via_its_parent() {
+        let root = temp_dir("watch-delete-directory");
+        fs::create_dir(root.join("dir")).unwrap();
+        fs::write(root.join("dir/file"), b"").unwrap();
+        let mut sidebar = Sidebar::with_config(&root, fast_refresh_config()).unwrap();
+        sidebar.request_expand(&root);
+        wait_until(&mut sidebar, |sidebar| {
+            sidebar.nodes.contains_key(&root.join("dir"))
+        });
+        sidebar.request_expand(&root.join("dir"));
+        wait_until(&mut sidebar, |sidebar| {
+            sidebar
+                .nodes
+                .get(&root.join("dir"))
+                .is_some_and(|node| node.loaded)
+        });
+
+        fs::remove_dir_all(root.join("dir")).unwrap();
+        wait_until(&mut sidebar, |sidebar| {
+            !sidebar.nodes.contains_key(&root.join("dir"))
+        });
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transient_reload_failure_keeps_a_loaded_directory_retryable() {
+        let root = temp_dir("watch-retry");
+        let mut sidebar = Sidebar::with_config(&root, fast_refresh_config()).unwrap();
+        sidebar.request_expand(&root);
+        let pending = sidebar.pending_loads[&root];
+        wait_until(&mut sidebar, |sidebar| {
+            sidebar.nodes.get(&root).is_some_and(|node| node.loaded)
+        });
+
+        let retry = sidebar.take_id();
+        sidebar.pending_loads.insert(root.clone(), retry);
+        assert!(sidebar.apply_response(Response::Load {
+            id: retry,
+            path: root.clone(),
+            result: Err("transient".into()),
+        }));
+        assert!(sidebar.nodes.get(&root).is_some_and(|node| node.loaded));
+        assert_ne!(pending, retry);
+        assert!(sidebar.request_reload(&root));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn periodic_reconciliation_recovers_without_a_watcher() {
+        let root = temp_dir("watch-fallback");
+        let mut sidebar = Sidebar::with_config(&root, fast_refresh_config()).unwrap();
+        sidebar.request_expand(&root);
+        wait_until(&mut sidebar, |sidebar| {
+            sidebar.nodes.get(&root).is_some_and(|node| node.loaded)
+        });
+        sidebar._watcher = None;
+
+        fs::write(root.join("eventually"), b"").unwrap();
+        wait_until(&mut sidebar, |sidebar| {
+            sidebar.nodes.contains_key(&root.join("eventually"))
+        });
         fs::remove_dir_all(root).unwrap();
     }
 
