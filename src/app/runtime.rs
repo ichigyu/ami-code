@@ -23,9 +23,10 @@ use crate::backend::{
 };
 use crate::terminal::{PasteError, ProcessSpec, TerminalSession, TerminalSize};
 use crate::ui::{
-    ContextMenu, ContextMenuAction, ShellTerminalPaneView, SidebarStyle, SidebarTrustChrome,
-    SidebarTrustTarget, TerminalPaneStyle, render_compact_workbench, render_context_menu,
-    render_layout_controls, render_shell_terminal_pane, render_sidebar, render_terminal_pane,
+    ContextMenu, ContextMenuAction, ShellTerminalPaneView, SidebarEditKind, SidebarEditView,
+    SidebarStyle, SidebarTrustChrome, SidebarTrustTarget, SidebarView, TerminalPaneStyle,
+    render_compact_workbench, render_context_menu, render_layout_controls,
+    render_shell_terminal_pane, render_sidebar, render_terminal_pane,
     render_unavailable_terminal_pane, shell_terminal_content_size, sidebar_trust_hit,
     sidebar_trust_rows, terminal_content_size,
 };
@@ -34,7 +35,7 @@ use crate::workbench::{
     MIN_TERMINAL_WIDTH, MouseTarget, PaneId, ShellTabId, ShellTabTarget, WorkbenchLayout,
     WorkbenchLayoutConfig, WorkbenchState, hit_test, shell_tab_hit_test,
 };
-use crate::workspace::sidebar::{Sidebar, SidebarActivation};
+use crate::workspace::sidebar::{Sidebar, SidebarActivation, SidebarMutation};
 use crate::workspace::{Workspace, WorkspaceTrustState, WorkspaceTrustStore};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
@@ -85,10 +86,27 @@ enum ContextMenuKeyAction {
     Dismiss,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ContextMenuState {
     menu: ContextMenu,
     pane: PaneId,
+    sidebar_target: Option<std::path::PathBuf>,
+    direct_target: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SidebarEditState {
+    kind: SidebarEditKind,
+    target: std::path::PathBuf,
+    value: String,
+    error: Option<String>,
+    pending: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SidebarDeleteState {
+    target: std::path::PathBuf,
+    pending: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -773,6 +791,8 @@ struct AppRuntime {
     last_sidebar_click: Option<(std::path::PathBuf, Instant)>,
     pending_layout: Option<PendingLayoutGesture>,
     context_menu: Option<ContextMenuState>,
+    sidebar_edit: Option<SidebarEditState>,
+    sidebar_delete: Option<SidebarDeleteState>,
     layout_store: Option<LayoutStore>,
     trust_store: Option<WorkspaceTrustStore>,
     trust_state: WorkspaceTrustState,
@@ -851,7 +871,7 @@ impl AppRuntime {
             )?
         };
         let (sidebar, sidebar_error) = if launch_mode.is_workbench() {
-            match Sidebar::new(workspace.root().to_path_buf()) {
+            match Sidebar::with_trust(workspace.root().to_path_buf(), trust_store.clone()) {
                 Ok(mut sidebar) => {
                     debug_assert_eq!(sidebar.root(), workspace.root());
                     sidebar.request_initial();
@@ -877,6 +897,8 @@ impl AppRuntime {
             last_sidebar_click: None,
             pending_layout: None,
             context_menu: None,
+            sidebar_edit: None,
+            sidebar_delete: None,
             layout_store,
             trust_store,
             trust_state,
@@ -891,8 +913,30 @@ impl AppRuntime {
             self.next_trust_refresh = now + TRUST_REFRESH_INTERVAL;
             self.refresh_trust_state(now);
         }
-        if let Some(sidebar) = &mut self.sidebar {
+        let mutation_completion = if let Some(sidebar) = &mut self.sidebar {
             sidebar.tick();
+            sidebar.take_mutation_completion()
+        } else {
+            None
+        };
+        if let Some(completion) = mutation_completion {
+            match completion.result {
+                Ok(()) => {
+                    self.sidebar_edit = None;
+                    self.sidebar_delete = None;
+                    self.status = None;
+                }
+                Err(error) => {
+                    if let Some(edit) = &mut self.sidebar_edit {
+                        edit.pending = false;
+                        edit.error = Some(error.clone());
+                    }
+                    if self.sidebar_delete.is_some() {
+                        self.sidebar_delete = None;
+                    }
+                    self.set_status(error);
+                }
+            }
         }
         let exited = self.sessions.poll(now)?;
         for id in exited {
@@ -1022,14 +1066,23 @@ impl AppRuntime {
                 .as_ref()
                 .and_then(Sidebar::git_error)
                 .or(self.sidebar_error.as_deref());
+            let edit = self.sidebar_edit.as_ref().map(|edit| SidebarEditView {
+                target: &edit.target,
+                value: &edit.value,
+                kind: edit.kind,
+                error: edit.error.as_deref(),
+            });
             render_sidebar(
                 frame,
                 layout.sidebar,
-                &rows,
-                trust,
-                error,
-                self.workbench.is_focused(PaneId::Sidebar),
-                SidebarStyle::default(),
+                SidebarView {
+                    rows: &rows,
+                    edit,
+                    trust,
+                    error,
+                    focused: self.workbench.is_focused(PaneId::Sidebar),
+                    style: SidebarStyle::default(),
+                },
             );
         }
 
@@ -1054,8 +1107,8 @@ impl AppRuntime {
             }
         }
         render_layout_controls(frame, layout);
-        if let Some(context_menu) = self.context_menu {
-            render_context_menu(frame, context_menu.menu);
+        if let Some(context_menu) = &self.context_menu {
+            render_context_menu(frame, &context_menu.menu);
         }
     }
 
@@ -1140,7 +1193,18 @@ impl AppRuntime {
                     self.shutdown();
                     return Ok(false);
                 }
+                if self.sidebar_delete.is_some() {
+                    self.handle_sidebar_delete_key(key);
+                    return Ok(true);
+                }
+                if self.sidebar_edit.is_some() {
+                    self.handle_sidebar_edit_key(key);
+                    return Ok(true);
+                }
                 if let Some(context) = self.context_menu.take() {
+                    if context.sidebar_target.is_some() {
+                        return Ok(true);
+                    }
                     let copy_enabled = context_menu_copy_enabled(&self.workbench, context.pane);
                     match context_menu_key_action(key, copy_enabled) {
                         ContextMenuKeyAction::Copy => self.copy_selection(),
@@ -1182,6 +1246,13 @@ impl AppRuntime {
                 }
             }
             Event::Paste(contents) => {
+                if let Some(edit) = &mut self.sidebar_edit {
+                    if !edit.pending {
+                        edit.value.push_str(&contents);
+                        edit.error = None;
+                    }
+                    return Ok(true);
+                }
                 self.pending_mouse = None;
                 self.cancel_layout_gesture();
                 self.context_menu = None;
@@ -1230,7 +1301,29 @@ impl AppRuntime {
         let Some(layout) = self.layout else {
             return Ok(());
         };
-        if let Some(mut context) = self.context_menu {
+        if self.sidebar_edit.as_ref().is_some_and(|edit| edit.pending)
+            || self
+                .sidebar_delete
+                .as_ref()
+                .is_some_and(|delete| delete.pending)
+        {
+            return Ok(());
+        }
+        let clear_modal_status = self.sidebar_delete.is_some()
+            || self
+                .sidebar_edit
+                .as_ref()
+                .is_some_and(|edit| edit.error.is_some());
+        if self.sidebar_edit.is_some() {
+            self.sidebar_edit = None;
+        }
+        if self.sidebar_delete.is_some() {
+            self.sidebar_delete = None;
+        }
+        if clear_modal_status {
+            self.status = None;
+        }
+        if let Some(mut context) = self.context_menu.clone() {
             if event.kind == MouseEventKind::Moved {
                 context.menu.update_hover(event.column, event.row);
                 self.context_menu = Some(context);
@@ -1245,6 +1338,7 @@ impl AppRuntime {
                         self.clear_selection();
                         self.paste_system_clipboard()?;
                     }
+                    Some(action) => self.begin_sidebar_action(&context, action),
                     None => {}
                 }
                 return Ok(());
@@ -1258,19 +1352,75 @@ impl AppRuntime {
             self.last_sidebar_click = None;
             self.cancel_layout_gesture();
             self.context_menu = None;
-            if let Some(MouseTarget::Content { pane, .. }) =
-                hit_test(layout, event.column, event.row)
-            {
-                self.workbench.focus_pane(pane);
-                self.context_menu = Some(ContextMenuState {
-                    menu: ContextMenu::new(
-                        self.viewport_area,
-                        event.column,
-                        event.row,
-                        context_menu_copy_enabled(&self.workbench, pane),
-                    ),
-                    pane,
-                });
+            match hit_test(layout, event.column, event.row) {
+                Some(MouseTarget::Content { pane, .. }) => {
+                    self.workbench.focus_pane(pane);
+                    self.context_menu = Some(ContextMenuState {
+                        menu: ContextMenu::new(
+                            self.viewport_area,
+                            event.column,
+                            event.row,
+                            context_menu_copy_enabled(&self.workbench, pane),
+                        ),
+                        pane,
+                        sidebar_target: None,
+                        direct_target: false,
+                    });
+                }
+                Some(MouseTarget::Sidebar { row, .. }) => {
+                    self.workbench.focus_pane(PaneId::Sidebar);
+                    let trust = self.sidebar_trust_chrome();
+                    let row = usize::from(row);
+                    if sidebar_trust_hit(trust, row).is_some() {
+                        return Ok(());
+                    }
+                    let viewport_rows = sidebar_tree_viewport_rows(layout.sidebar, trust);
+                    let tree_row = row.saturating_sub(sidebar_trust_rows(trust));
+                    let selected = self
+                        .sidebar
+                        .as_mut()
+                        .and_then(|sidebar| sidebar.select_visible_row(tree_row, viewport_rows));
+                    let direct_target = selected.is_some();
+                    let target = selected.or_else(|| {
+                        self.sidebar
+                            .as_ref()
+                            .and_then(Sidebar::selected_path)
+                            .map(std::path::Path::to_path_buf)
+                    });
+                    let target = target.unwrap_or_else(|| {
+                        self.sidebar
+                            .as_ref()
+                            .map(|sidebar| sidebar.root().to_path_buf())
+                            .unwrap_or_default()
+                    });
+                    let kind = self
+                        .sidebar
+                        .as_ref()
+                        .and_then(|sidebar| sidebar.entry_kind(&target));
+                    let trusted = self.trust_state == WorkspaceTrustState::Trusted;
+                    let create_enabled = trusted
+                        && kind != Some(crate::workspace::sidebar::EntryKind::SymlinkDirectory);
+                    let item_enabled = trusted
+                        && direct_target
+                        && self
+                            .sidebar
+                            .as_ref()
+                            .is_some_and(|sidebar| target != sidebar.root())
+                        && kind != Some(crate::workspace::sidebar::EntryKind::Deleted);
+                    self.context_menu = Some(ContextMenuState {
+                        menu: ContextMenu::sidebar(
+                            self.viewport_area,
+                            event.column,
+                            event.row,
+                            create_enabled,
+                            item_enabled,
+                        ),
+                        pane: PaneId::Sidebar,
+                        sidebar_target: Some(target),
+                        direct_target,
+                    });
+                }
+                _ => {}
             }
             return Ok(());
         }
@@ -1564,6 +1714,186 @@ impl AppRuntime {
             now,
         )?;
         Ok(())
+    }
+
+    fn begin_sidebar_action(&mut self, context: &ContextMenuState, action: ContextMenuAction) {
+        let Some(target) = context.sidebar_target.clone() else {
+            return;
+        };
+        match action {
+            ContextMenuAction::NewFile | ContextMenuAction::NewFolder => {
+                let parent = self
+                    .sidebar
+                    .as_ref()
+                    .and_then(|sidebar| {
+                        sidebar
+                            .entry_kind(&target)
+                            .filter(|kind| kind.is_directory())
+                            .map(|_| target.clone())
+                    })
+                    .or_else(|| target.parent().map(std::path::Path::to_path_buf));
+                let Some(parent) = parent else {
+                    return;
+                };
+                let trust = self.sidebar_trust_chrome();
+                let viewport_rows = self
+                    .layout
+                    .map(|layout| sidebar_tree_viewport_rows(layout.sidebar, trust))
+                    .unwrap_or(0);
+                if let Some(sidebar) = &mut self.sidebar {
+                    sidebar.request_expand(&parent);
+                    sidebar.ensure_path_visible_with_trailing(&parent, viewport_rows, 1);
+                }
+                self.status = None;
+                self.sidebar_edit = Some(SidebarEditState {
+                    kind: if action == ContextMenuAction::NewFolder {
+                        SidebarEditKind::NewFolder
+                    } else {
+                        SidebarEditKind::NewFile
+                    },
+                    target: parent,
+                    value: String::new(),
+                    error: None,
+                    pending: false,
+                });
+            }
+            ContextMenuAction::Rename if context.direct_target => {
+                let Some(name) = target
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .map(ToOwned::to_owned)
+                else {
+                    self.set_status("non-UTF-8 names cannot be renamed in the sidebar");
+                    return;
+                };
+                self.status = None;
+                self.sidebar_edit = Some(SidebarEditState {
+                    kind: SidebarEditKind::Rename,
+                    target,
+                    value: name,
+                    error: None,
+                    pending: false,
+                });
+            }
+            ContextMenuAction::Delete if context.direct_target => {
+                self.set_status(format!(
+                    "move {} to trash? Enter confirm, Esc cancel",
+                    target.display()
+                ));
+                self.sidebar_delete = Some(SidebarDeleteState {
+                    target,
+                    pending: false,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_sidebar_edit_key(&mut self, key: KeyEvent) {
+        let Some(edit) = &mut self.sidebar_edit else {
+            return;
+        };
+        if edit.pending {
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.sidebar_edit = None;
+                self.status = None;
+            }
+            KeyCode::Enter => self.submit_sidebar_edit(),
+            KeyCode::Backspace => {
+                edit.value.pop();
+                edit.error = None;
+                self.status = None;
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                edit.value.push(character);
+                edit.error = None;
+                self.status = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn submit_sidebar_edit(&mut self) {
+        let Some(edit) = self.sidebar_edit.clone() else {
+            return;
+        };
+        let mutation = match edit.kind {
+            SidebarEditKind::NewFile => SidebarMutation::CreateFile {
+                parent: edit.target,
+                name: edit.value,
+            },
+            SidebarEditKind::NewFolder => SidebarMutation::CreateDirectory {
+                parent: edit.target,
+                name: edit.value,
+            },
+            SidebarEditKind::Rename => SidebarMutation::Rename {
+                source: edit.target,
+                name: edit.value,
+            },
+        };
+        let result = self
+            .sidebar
+            .as_mut()
+            .ok_or_else(|| "sidebar is unavailable".to_owned())
+            .and_then(|sidebar| sidebar.request_mutation(mutation));
+        match result {
+            Ok(()) => {
+                if let Some(edit) = &mut self.sidebar_edit {
+                    edit.pending = true;
+                    edit.error = None;
+                }
+                self.set_status("sidebar file operation pending");
+            }
+            Err(error) => {
+                if let Some(edit) = &mut self.sidebar_edit {
+                    edit.error = Some(error.clone());
+                }
+                self.set_status(error);
+            }
+        }
+    }
+
+    fn handle_sidebar_delete_key(&mut self, key: KeyEvent) {
+        let Some(delete) = self.sidebar_delete.clone() else {
+            return;
+        };
+        if delete.pending {
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.sidebar_delete = None;
+                self.status = None;
+            }
+            KeyCode::Enter => {
+                let result = self
+                    .sidebar
+                    .as_mut()
+                    .ok_or_else(|| "sidebar is unavailable".to_owned())
+                    .and_then(|sidebar| {
+                        sidebar.request_mutation(SidebarMutation::Trash {
+                            target: delete.target.clone(),
+                        })
+                    });
+                match result {
+                    Ok(()) => {
+                        if let Some(delete) = &mut self.sidebar_delete {
+                            delete.pending = true;
+                        }
+                        self.set_status(format!("moving {} to trash...", delete.target.display()));
+                    }
+                    Err(error) => self.set_status(error),
+                }
+            }
+            _ => {}
+        }
     }
 
     fn activate_sidebar_selection(&mut self) {

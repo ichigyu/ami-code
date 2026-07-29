@@ -14,7 +14,11 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+
+use super::{WorkspaceTrustState, WorkspaceTrustStore};
 
 /// Default maximum number of children loaded from one directory.
 pub const DEFAULT_ENTRY_CAP: usize = 10_000;
@@ -83,6 +87,19 @@ pub struct GitChange {
     pub path: PathBuf,
     pub original_path: Option<PathBuf>,
     pub status: GitStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarMutation {
+    CreateFile { parent: PathBuf, name: String },
+    CreateDirectory { parent: PathBuf, name: String },
+    Rename { source: PathBuf, name: String },
+    Trash { target: PathBuf },
+}
+
+#[derive(Debug)]
+pub struct SidebarMutationCompletion {
+    pub result: Result<(), String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +174,12 @@ enum Job {
         root: PathBuf,
         cap: usize,
     },
+    Mutation {
+        id: u64,
+        root: PathBuf,
+        trust: Option<WorkspaceTrustStore>,
+        mutation: SidebarMutation,
+    },
 }
 
 enum Response {
@@ -169,11 +192,21 @@ enum Response {
         id: u64,
         result: Result<Vec<GitChange>, String>,
     },
+    Mutation {
+        id: u64,
+        result: Result<MutationOutcome, String>,
+    },
 }
 
 enum WatchSignal {
     Paths(Vec<PathBuf>),
     Rescan,
+}
+
+#[derive(Debug)]
+struct MutationOutcome {
+    affected_parent: PathBuf,
+    selected: PathBuf,
 }
 
 struct LoadedDirectory {
@@ -238,14 +271,34 @@ pub struct Sidebar {
     watch_dirty_since: Option<Instant>,
     reload_after_pending: HashSet<PathBuf>,
     next_fs_reconcile: Instant,
+    trust_store: Option<WorkspaceTrustStore>,
+    pending_mutation: Option<u64>,
+    mutation_completion: Option<SidebarMutationCompletion>,
 }
 
 impl Sidebar {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
-        Self::with_config(root, SidebarConfig::default())
+        Self::with_config_and_trust(root, SidebarConfig::default(), None)
     }
 
+    pub fn with_trust(
+        root: impl Into<PathBuf>,
+        trust_store: Option<WorkspaceTrustStore>,
+    ) -> io::Result<Self> {
+        Self::with_config_and_trust(root, SidebarConfig::default(), trust_store)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_config(root: impl Into<PathBuf>, config: SidebarConfig) -> io::Result<Self> {
+        Self::with_config_and_trust(root, config, None)
+    }
+
+    fn with_config_and_trust(
+        root: impl Into<PathBuf>,
+        config: SidebarConfig,
+        trust_store: Option<WorkspaceTrustStore>,
+    ) -> io::Result<Self> {
         if config.entry_cap == 0 || config.channel_capacity == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -330,6 +383,9 @@ impl Sidebar {
             watch_dirty_since: None,
             reload_after_pending: HashSet::new(),
             next_fs_reconcile,
+            trust_store,
+            pending_mutation: None,
+            mutation_completion: None,
         })
     }
 
@@ -593,9 +649,62 @@ impl Sidebar {
         self.scroll = self.scroll.saturating_add_signed(delta).min(maximum);
     }
 
+    pub fn ensure_path_visible_with_trailing(
+        &mut self,
+        path: &Path,
+        viewport_rows: usize,
+        trailing_rows: usize,
+    ) {
+        if viewport_rows == 0 {
+            return;
+        }
+        let rows = self.flatten_rows();
+        let Some(position) = rows.iter().position(|row| row.path == path) else {
+            return;
+        };
+        if position < self.scroll {
+            self.scroll = position;
+        } else if position.saturating_add(trailing_rows) >= self.scroll + viewport_rows {
+            self.scroll = position
+                .saturating_add(trailing_rows)
+                .saturating_add(1)
+                .saturating_sub(viewport_rows)
+                .min(rows.len().saturating_sub(1));
+        }
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn selected_path(&self) -> Option<&Path> {
         self.selected.as_deref()
+    }
+
+    pub fn entry_kind(&self, path: &Path) -> Option<EntryKind> {
+        self.nodes.get(path).map(|node| node.kind)
+    }
+
+    pub fn request_mutation(&mut self, mutation: SidebarMutation) -> Result<(), String> {
+        if self.pending_mutation.is_some() {
+            return Err("a sidebar file operation is already pending".into());
+        }
+        let id = self.take_id();
+        let job = Job::Mutation {
+            id,
+            root: self.root.clone(),
+            trust: self.trust_store.clone(),
+            mutation,
+        };
+        match self.jobs.try_send(job) {
+            Ok(()) => {
+                self.pending_mutation = Some(id);
+                Ok(())
+            }
+            Err(TrySendError::Full(_)) => Err("sidebar worker is busy".into()),
+            Err(TrySendError::Disconnected(_)) => Err("sidebar worker is unavailable".into()),
+        }
+    }
+
+    pub fn take_mutation_completion(&mut self) -> Option<SidebarMutationCompletion> {
+        self.mutation_completion.take()
     }
 
     /// Last Git worker error. Non-Git workspaces and command failures degrade to
@@ -730,6 +839,27 @@ impl Sidebar {
                         self.git_error = Some(error);
                         self.git_changes.clear();
                         self.clear_git();
+                    }
+                }
+                true
+            }
+            Response::Mutation { id, result } => {
+                if self.pending_mutation != Some(id) {
+                    return false;
+                }
+                self.pending_mutation = None;
+                match result {
+                    Ok(outcome) => {
+                        self.selected = Some(outcome.selected);
+                        self.dirty_dirs.insert(outcome.affected_parent);
+                        self.schedule_dirty_reloads();
+                        self.request_git_refresh();
+                        self.mutation_completion =
+                            Some(SidebarMutationCompletion { result: Ok(()) });
+                    }
+                    Err(error) => {
+                        self.mutation_completion =
+                            Some(SidebarMutationCompletion { result: Err(error) });
                     }
                 }
                 true
@@ -892,11 +1022,290 @@ fn worker(jobs: Receiver<Job>, responses: SyncSender<Response>) {
                 id,
                 result: load_git(&root, cap),
             },
+            Job::Mutation {
+                id,
+                root,
+                trust,
+                mutation,
+            } => Response::Mutation {
+                id,
+                result: perform_mutation(&root, trust.as_ref(), mutation),
+            },
         };
         if responses.send(response).is_err() {
             break;
         }
     }
+}
+
+fn perform_mutation(
+    root: &Path,
+    trust: Option<&WorkspaceTrustStore>,
+    mutation: SidebarMutation,
+) -> Result<MutationOutcome, String> {
+    let trust = trust.ok_or_else(|| "workspace trust is unavailable".to_owned())?;
+    verify_mutation_trust(trust)?;
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve workspace root: {error}"))?;
+    let root_dir = Dir::open_ambient_dir(&root, ambient_authority())
+        .map_err(|error| format!("failed to open workspace root: {error}"))?;
+    verify_mutation_trust(trust)?;
+    match mutation {
+        SidebarMutation::CreateFile { parent, name } => {
+            let parent = open_mutation_parent(&root, &root_dir, &parent)?;
+            let name = validate_mutation_name(&name)?;
+            let mut options = CapOpenOptions::new();
+            options.write(true).create_new(true);
+            parent.dir.open_with(name, &options).map_err(|error| {
+                format!(
+                    "failed to create {}: {error}",
+                    parent.absolute.join(name).display()
+                )
+            })?;
+            Ok(MutationOutcome {
+                affected_parent: parent.absolute.clone(),
+                selected: parent.absolute.join(name),
+            })
+        }
+        SidebarMutation::CreateDirectory { parent, name } => {
+            let parent = open_mutation_parent(&root, &root_dir, &parent)?;
+            let name = validate_mutation_name(&name)?;
+            parent.dir.create_dir(name).map_err(|error| {
+                format!(
+                    "failed to create {}: {error}",
+                    parent.absolute.join(name).display()
+                )
+            })?;
+            Ok(MutationOutcome {
+                affected_parent: parent.absolute.clone(),
+                selected: parent.absolute.join(name),
+            })
+        }
+        SidebarMutation::Rename { source, name } => {
+            let source = open_mutation_leaf(&root, &root_dir, &source)?;
+            let destination = validate_mutation_name(&name)?;
+            let target = source.parent.absolute.join(destination);
+            secure_rename_noreplace(
+                &source.parent.dir,
+                &source.name,
+                &source.parent.dir,
+                destination,
+            )
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    format!("{} already exists", target.display())
+                } else {
+                    format!(
+                        "failed to rename {} to {}: {error}",
+                        source.absolute.display(),
+                        target.display()
+                    )
+                }
+            })?;
+            Ok(MutationOutcome {
+                affected_parent: source.parent.absolute,
+                selected: target,
+            })
+        }
+        SidebarMutation::Trash { target } => {
+            let target = open_mutation_leaf(&root, &root_dir, &target)?;
+            if !root_path_matches_handle(&root, &root_dir) {
+                return Err("workspace path changed before trash".into());
+            }
+            trash::delete(&target.absolute).map_err(|error| {
+                format!(
+                    "failed to move {} to trash; original was not permanently deleted: {error}",
+                    target.absolute.display()
+                )
+            })?;
+            Ok(MutationOutcome {
+                affected_parent: target.parent.absolute.clone(),
+                selected: target.parent.absolute,
+            })
+        }
+    }
+}
+
+fn verify_mutation_trust(trust: &WorkspaceTrustStore) -> Result<(), String> {
+    match trust.resolve() {
+        Ok(WorkspaceTrustState::Trusted) => Ok(()),
+        Ok(WorkspaceTrustState::Untrusted | WorkspaceTrustState::Stale) => {
+            Err("workspace is not trusted".into())
+        }
+        Err(error) => Err(format!("failed to verify workspace trust: {error:#}")),
+    }
+}
+
+struct MutationParent {
+    dir: Dir,
+    absolute: PathBuf,
+}
+
+struct MutationLeaf {
+    parent: MutationParent,
+    name: OsString,
+    absolute: PathBuf,
+}
+
+fn open_mutation_parent(
+    root: &Path,
+    root_dir: &Dir,
+    parent: &Path,
+) -> Result<MutationParent, String> {
+    let relative = parent
+        .strip_prefix(root)
+        .map_err(|_| "file operation escapes the workspace".to_owned())?;
+    let mut dir = root_dir
+        .try_clone()
+        .map_err(|error| format!("failed to clone workspace handle: {error}"))?;
+    let mut absolute = root.to_path_buf();
+    for (index, component) in relative.components().enumerate() {
+        let Component::Normal(name) = component else {
+            return Err("invalid file operation path".into());
+        };
+        if index == 0 && name == OsStr::new(".git") {
+            return Err("workspace .git cannot be modified".into());
+        }
+        let metadata = dir.symlink_metadata(name).map_err(|error| {
+            format!(
+                "failed to inspect {}: {error}",
+                absolute.join(name).display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err("file operations inside symlink directories are not allowed".into());
+        }
+        let next = dir.open_dir(name).map_err(|error| {
+            format!("failed to open {}: {error}", absolute.join(name).display())
+        })?;
+        if dir
+            .symlink_metadata(name)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(true)
+        {
+            return Err("file operation path changed during validation".into());
+        }
+        absolute.push(name);
+        dir = next;
+    }
+    Ok(MutationParent { dir, absolute })
+}
+
+fn open_mutation_leaf(root: &Path, root_dir: &Dir, target: &Path) -> Result<MutationLeaf, String> {
+    if target == root {
+        return Err("workspace root cannot be modified".into());
+    }
+    let relative = target
+        .strip_prefix(root)
+        .map_err(|_| "file operation escapes the workspace".to_owned())?;
+    let mut components = relative.components().collect::<Vec<_>>();
+    let Some(Component::Normal(name)) = components.pop() else {
+        return Err("file operation target has no name".into());
+    };
+    if components
+        .first()
+        .is_some_and(|component| component.as_os_str() == OsStr::new(".git"))
+    {
+        return Err("workspace .git cannot be modified".into());
+    }
+    if components
+        .iter()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err("invalid file operation path".into());
+    }
+    let parent_relative = components
+        .iter()
+        .fold(PathBuf::new(), |mut path, component| {
+            path.push(component.as_os_str());
+            path
+        });
+    let parent = open_mutation_parent(root, root_dir, &root.join(parent_relative))?;
+    parent
+        .dir
+        .symlink_metadata(name)
+        .map_err(|error| format!("failed to inspect {}: {error}", target.display()))?;
+    Ok(MutationLeaf {
+        parent,
+        name: name.to_os_string(),
+        absolute: target.to_path_buf(),
+    })
+}
+
+fn validate_mutation_name(name: &str) -> Result<&OsStr, String> {
+    let mut components = Path::new(name).components();
+    let Some(Component::Normal(component)) = components.next() else {
+        return Err("name must be one non-empty path component".into());
+    };
+    if components.next().is_some() || component == OsStr::new(".git") {
+        return Err("name must be one non-.git path component".into());
+    }
+    Ok(component)
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn secure_rename_noreplace(
+    source_dir: &Dir,
+    source: &OsStr,
+    destination_dir: &Dir,
+    destination: &OsStr,
+) -> io::Result<()> {
+    Ok(rustix::fs::renameat_with(
+        source_dir,
+        source,
+        destination_dir,
+        destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )?)
+}
+
+#[cfg(windows)]
+fn secure_rename_noreplace(
+    source_dir: &Dir,
+    source: &OsStr,
+    destination_dir: &Dir,
+    destination: &OsStr,
+) -> io::Result<()> {
+    // Windows rename fails when the destination exists; unlike Unix it does
+    // not need an explicit no-replace flag.
+    source_dir.rename(source, destination_dir, destination)
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    windows
+)))]
+fn secure_rename_noreplace(
+    _source_dir: &Dir,
+    _source: &OsStr,
+    _destination_dir: &Dir,
+    _destination: &OsStr,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unsupported on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn root_path_matches_handle(root: &Path, root_dir: &Dir) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(open) = rustix::fs::fstat(root_dir) else {
+        return false;
+    };
+    let Ok(current) = fs::metadata(root) else {
+        return false;
+    };
+    current.dev() == open.st_dev as u64 && current.ino() == open.st_ino
+}
+
+#[cfg(not(unix))]
+fn root_path_matches_handle(root: &Path, _root_dir: &Dir) -> bool {
+    root.canonicalize().is_ok_and(|canonical| canonical == root)
 }
 
 fn load_directory(
@@ -1647,6 +2056,28 @@ u UU N... 100644 100644 100644 100644 a b c conflict\0\
     }
 
     #[test]
+    fn viewport_reserves_space_for_a_new_entry_editor() {
+        let root = temp_dir("edit-viewport");
+        for name in ["a", "b", "c", "d"] {
+            fs::write(root.join(name), b"").unwrap();
+        }
+        let mut sidebar = Sidebar::new(&root).unwrap();
+        sidebar.request_expand(&root);
+        wait_until(&mut sidebar, |sidebar| {
+            sidebar.nodes.get(&root).is_some_and(|node| node.loaded)
+        });
+
+        sidebar.ensure_path_visible_with_trailing(&root.join("c"), 3, 1);
+        let visible = sidebar.visible_rows(3);
+        let position = visible
+            .iter()
+            .position(|row| row.path == root.join("c"))
+            .unwrap();
+        assert!(position + 1 < 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn periodic_reconciliation_recovers_without_a_watcher() {
         let root = temp_dir("watch-fallback");
         let mut sidebar = Sidebar::with_config(&root, fast_refresh_config()).unwrap();
@@ -1661,6 +2092,223 @@ u UU N... 100644 100644 100644 100644 a b c conflict\0\
             sidebar.nodes.contains_key(&root.join("eventually"))
         });
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn trusted_store(root: &Path, label: &str) -> (WorkspaceTrustStore, PathBuf) {
+        let state = temp_dir(label);
+        let store = WorkspaceTrustStore::new(root, &state).unwrap();
+        store.trust().unwrap();
+        (store, state)
+    }
+
+    fn wait_for_mutation(sidebar: &mut Sidebar) -> Result<(), String> {
+        for _ in 0..400 {
+            sidebar.tick();
+            if let Some(completion) = sidebar.take_mutation_completion() {
+                return completion.result;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("sidebar mutation did not complete");
+    }
+
+    #[test]
+    fn trusted_worker_creates_and_renames_without_overwriting() {
+        let root = temp_dir("mutation-worker");
+        let (store, state) = trusted_store(&root, "mutation-state");
+        let mut sidebar =
+            Sidebar::with_config_and_trust(&root, fast_refresh_config(), Some(store)).unwrap();
+        sidebar.request_expand(&root);
+        wait_until(&mut sidebar, |sidebar| {
+            sidebar.nodes.get(&root).is_some_and(|node| node.loaded)
+        });
+
+        sidebar
+            .request_mutation(SidebarMutation::CreateFile {
+                parent: root.clone(),
+                name: "file.txt".into(),
+            })
+            .unwrap();
+        wait_for_mutation(&mut sidebar).unwrap();
+        assert!(root.join("file.txt").is_file());
+
+        sidebar
+            .request_mutation(SidebarMutation::Rename {
+                source: root.join("file.txt"),
+                name: "renamed.txt".into(),
+            })
+            .unwrap();
+        wait_for_mutation(&mut sidebar).unwrap();
+        assert!(root.join("renamed.txt").is_file());
+
+        fs::write(root.join("taken"), b"").unwrap();
+        sidebar
+            .request_mutation(SidebarMutation::Rename {
+                source: root.join("renamed.txt"),
+                name: "taken".into(),
+            })
+            .unwrap();
+        assert!(
+            wait_for_mutation(&mut sidebar)
+                .unwrap_err()
+                .contains("already exists")
+        );
+        assert!(root.join("renamed.txt").exists());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn worker_revalidates_trust_before_mutation() {
+        let root = temp_dir("mutation-trust");
+        let (store, state) = trusted_store(&root, "mutation-trust-state");
+        store.revoke().unwrap();
+        let error = perform_mutation(
+            &root,
+            Some(&store),
+            SidebarMutation::CreateDirectory {
+                parent: root.clone(),
+                name: "blocked".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("not trusted"));
+        assert!(!root.join("blocked").exists());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutations_do_not_follow_symlink_leaves_or_directory_parents() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("mutation-links");
+        let outside = temp_dir("mutation-links-outside");
+        let (store, state) = trusted_store(&root, "mutation-links-state");
+        fs::write(outside.join("target"), b"outside").unwrap();
+        symlink(outside.join("target"), root.join("link")).unwrap();
+        perform_mutation(
+            &root,
+            Some(&store),
+            SidebarMutation::Rename {
+                source: root.join("link"),
+                name: "renamed-link".into(),
+            },
+        )
+        .unwrap();
+        assert!(
+            fs::symlink_metadata(root.join("renamed-link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(outside.join("target")).unwrap(), b"outside");
+
+        symlink(&outside, root.join("linked-dir")).unwrap();
+        let error = perform_mutation(
+            &root,
+            Some(&store),
+            SidebarMutation::CreateFile {
+                parent: root.join("linked-dir"),
+                name: "escape".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("symlink directories"));
+        assert!(!outside.join("escape").exists());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[test]
+    fn atomic_rename_never_replaces_a_concurrent_destination() {
+        use std::sync::{Arc, Barrier};
+
+        let root = temp_dir("mutation-atomic-rename");
+        fs::write(root.join("one"), b"one").unwrap();
+        fs::write(root.join("two"), b"two").unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+        for source in ["one", "two"] {
+            let root = root.clone();
+            let barrier = barrier.clone();
+            threads.push(thread::spawn(move || {
+                let dir = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+                barrier.wait();
+                secure_rename_noreplace(&dir, OsStr::new(source), &dir, OsStr::new("destination"))
+            }));
+        }
+        barrier.wait();
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == io::ErrorKind::AlreadyExists))
+                .count(),
+            1
+        );
+        assert!(root.join("destination").is_file());
+        assert_eq!(
+            [root.join("one"), root.join("two")]
+                .iter()
+                .filter(|path| path.exists())
+                .count(),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_parent_handle_cannot_be_redirected_by_a_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("mutation-parent-handle");
+        let outside = temp_dir("mutation-parent-outside");
+        fs::create_dir(root.join("dir")).unwrap();
+        let root_dir = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+        let parent = open_mutation_parent(&root, &root_dir, &root.join("dir")).unwrap();
+
+        fs::rename(root.join("dir"), root.join("held")).unwrap();
+        symlink(&outside, root.join("dir")).unwrap();
+        let mut options = CapOpenOptions::new();
+        options.write(true).create_new(true);
+        parent
+            .dir
+            .open_with("created", &options)
+            .expect("open directory handle remains bound to the original directory");
+        assert!(root.join("held/created").is_file());
+        assert!(!outside.join("created").exists());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn delete_moves_the_target_to_trash_without_a_permanent_fallback() {
+        let root = temp_dir("mutation-trash");
+        let (store, state) = trusted_store(&root, "mutation-trash-state");
+        let target = root.join(format!("trash-{}", std::process::id()));
+        fs::write(&target, b"recoverable").unwrap();
+        perform_mutation(
+            &root,
+            Some(&store),
+            SidebarMutation::Trash {
+                target: target.clone(),
+            },
+        )
+        .unwrap();
+        assert!(!target.exists());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(state).unwrap();
     }
 
     #[test]
