@@ -57,6 +57,8 @@ impl ContextMenu {
         row: u16,
         create_enabled: bool,
         item_actions_enabled: bool,
+        copy_enabled: bool,
+        paste_enabled: bool,
     ) -> Self {
         Self::from_items(
             viewport,
@@ -77,6 +79,16 @@ impl ContextMenu {
                     action: ContextMenuAction::Rename,
                     label: "Rename",
                     enabled: item_actions_enabled,
+                },
+                MenuItem {
+                    action: ContextMenuAction::Copy,
+                    label: "Copy",
+                    enabled: copy_enabled,
+                },
+                MenuItem {
+                    action: ContextMenuAction::Paste,
+                    label: "Paste",
+                    enabled: paste_enabled,
                 },
                 MenuItem {
                     action: ContextMenuAction::Delete,
@@ -204,11 +216,13 @@ mod tests {
 
     #[test]
     fn sidebar_menu_applies_capability_matrix_without_geometry_shift() {
-        let menu = ContextMenu::sidebar(Rect::new(0, 0, 30, 12), 2, 2, true, false);
-        assert_eq!(menu.area().height, 6);
+        let menu = ContextMenu::sidebar(Rect::new(0, 0, 30, 12), 2, 2, true, false, true, false);
+        assert_eq!(menu.area().height, 8);
         assert_eq!(menu.action_at(3, 3), Some(ContextMenuAction::NewFile));
         assert_eq!(menu.action_at(3, 4), Some(ContextMenuAction::NewFolder));
         assert_eq!(menu.action_at(3, 5), None);
-        assert_eq!(menu.action_at(3, 6), None);
+        assert_eq!(menu.action_at(3, 6), Some(ContextMenuAction::Copy));
+        assert_eq!(menu.action_at(3, 7), None);
+        assert_eq!(menu.action_at(3, 8), None);
     }
 }

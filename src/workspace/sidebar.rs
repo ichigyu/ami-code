@@ -10,6 +10,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,6 +27,7 @@ const GIT_OUTPUT_CAP_BYTES: usize = 4 * 1024 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const WATCH_CHANNEL_CAPACITY: usize = 64;
+static COPY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct SidebarConfig {
@@ -89,12 +91,35 @@ pub struct GitChange {
     pub status: GitStatus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarCopyMode {
+    NoReplace,
+    KeepBoth,
+    Replace,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebarMutation {
-    CreateFile { parent: PathBuf, name: String },
-    CreateDirectory { parent: PathBuf, name: String },
-    Rename { source: PathBuf, name: String },
-    Trash { target: PathBuf },
+    CreateFile {
+        parent: PathBuf,
+        name: String,
+    },
+    CreateDirectory {
+        parent: PathBuf,
+        name: String,
+    },
+    Rename {
+        source: PathBuf,
+        name: String,
+    },
+    Trash {
+        target: PathBuf,
+    },
+    Copy {
+        source: PathBuf,
+        destination_parent: PathBuf,
+        mode: SidebarCopyMode,
+    },
 }
 
 #[derive(Debug)]
@@ -1124,7 +1149,293 @@ fn perform_mutation(
                 selected: target.parent.absolute,
             })
         }
+        SidebarMutation::Copy {
+            source,
+            destination_parent,
+            mode,
+        } => perform_copy(&root, &root_dir, &source, &destination_parent, mode),
     }
+}
+
+fn perform_copy(
+    root: &Path,
+    root_dir: &Dir,
+    source: &Path,
+    destination_parent: &Path,
+    mode: SidebarCopyMode,
+) -> Result<MutationOutcome, String> {
+    let source = open_mutation_leaf(root, root_dir, source)?;
+    let destination = open_mutation_parent(root, root_dir, destination_parent)?;
+    let source_metadata = source
+        .parent
+        .dir
+        .symlink_metadata(&source.name)
+        .map_err(|error| format!("failed to inspect {}: {error}", source.absolute.display()))?;
+    if source_metadata.is_dir() && destination.absolute.starts_with(&source.absolute) {
+        return Err("a directory cannot be copied into itself".into());
+    }
+
+    let temporary = unique_hidden_name(&destination.dir, ".ami-code-copy")
+        .map_err(|error| format!("failed to allocate temporary copy path: {error}"))?;
+    if let Err(error) = copy_entry(
+        &source.parent.dir,
+        &source.name,
+        &destination.dir,
+        &temporary,
+    ) {
+        let _ = remove_entry(&destination.dir, &temporary);
+        return Err(format!(
+            "failed to copy {}: {error}",
+            source.absolute.display()
+        ));
+    }
+
+    let base_name = source.name.clone();
+    let published = match mode {
+        SidebarCopyMode::NoReplace => {
+            publish_copy(&destination.dir, &temporary, &base_name).map(|()| base_name.clone())
+        }
+        SidebarCopyMode::KeepBoth => {
+            let mut index = 1_u32;
+            loop {
+                let candidate = keep_both_name(&base_name, index);
+                match publish_copy(&destination.dir, &temporary, &candidate) {
+                    Ok(()) => break Ok(candidate),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        index = index.saturating_add(1);
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+        }
+        SidebarCopyMode::Replace => {
+            replace_copy(root, root_dir, &destination, &temporary, &base_name)
+                .map(|()| base_name.clone())
+        }
+    };
+
+    match published {
+        Ok(name) => Ok(MutationOutcome {
+            affected_parent: destination.absolute.clone(),
+            selected: destination.absolute.join(name),
+        }),
+        Err(error) => {
+            let _ = remove_entry(&destination.dir, &temporary);
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                Err(format!(
+                    "{} already exists",
+                    destination.absolute.join(&base_name).display()
+                ))
+            } else {
+                Err(format!(
+                    "failed to publish copy in {}: {error}",
+                    destination.absolute.display()
+                ))
+            }
+        }
+    }
+}
+
+fn copy_entry(
+    source_dir: &Dir,
+    source: &OsStr,
+    destination_dir: &Dir,
+    destination: &OsStr,
+) -> io::Result<()> {
+    let metadata = source_dir.symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() {
+        let target = source_dir.read_link_contents(source)?;
+        #[cfg(not(windows))]
+        destination_dir.symlink_contents(target, destination)?;
+        #[cfg(windows)]
+        {
+            if source_dir
+                .metadata(source)
+                .is_ok_and(|metadata| metadata.is_dir())
+            {
+                destination_dir.symlink_dir(target, destination)?;
+            } else {
+                destination_dir.symlink_file(target, destination)?;
+            }
+        }
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        destination_dir.create_dir(destination)?;
+        let source_child = source_dir.open_dir(source)?;
+        let destination_child = destination_dir.open_dir(destination)?;
+        for entry in source_child.entries()? {
+            let entry = entry?;
+            let name = entry.file_name();
+            copy_entry(&source_child, &name, &destination_child, &name)?;
+        }
+        destination_dir.set_permissions(destination, metadata.permissions())?;
+        return Ok(());
+    }
+    if metadata.is_file() {
+        let mut source_file = source_dir.open(source)?;
+        let mut options = CapOpenOptions::new();
+        options.write(true).create_new(true);
+        let mut destination_file = destination_dir.open_with(destination, &options)?;
+        io::copy(&mut source_file, &mut destination_file)?;
+        destination_dir.set_permissions(destination, metadata.permissions())?;
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "special filesystem entries cannot be copied",
+    ))
+}
+
+fn publish_copy(dir: &Dir, temporary: &OsStr, destination: &OsStr) -> io::Result<()> {
+    secure_rename_noreplace(dir, temporary, dir, destination)
+}
+
+fn replace_copy(
+    root: &Path,
+    root_dir: &Dir,
+    destination: &MutationParent,
+    temporary: &OsStr,
+    target: &OsStr,
+) -> io::Result<()> {
+    replace_copy_with_trash(root, root_dir, destination, temporary, target, |path| {
+        trash::delete(path).map_err(io::Error::other)
+    })
+}
+
+fn replace_copy_with_trash(
+    root: &Path,
+    root_dir: &Dir,
+    destination: &MutationParent,
+    temporary: &OsStr,
+    target: &OsStr,
+    trash_item: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    match destination.dir.symlink_metadata(target) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return publish_copy(&destination.dir, temporary, target);
+        }
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
+    let backup = unique_hidden_name(&destination.dir, ".ami-code-replaced")?;
+    secure_rename_noreplace(&destination.dir, target, &destination.dir, &backup)?;
+    if let Err(publish_error) = publish_copy(&destination.dir, temporary, target) {
+        let restore = secure_rename_noreplace(&destination.dir, &backup, &destination.dir, target);
+        return Err(match restore {
+            Ok(()) => publish_error,
+            Err(restore_error) => io::Error::other(format!(
+                "publish failed ({publish_error}); restore failed ({restore_error})"
+            )),
+        });
+    }
+
+    if !root_path_matches_handle(root, root_dir) {
+        return rollback_replacement(destination, target, &backup, "workspace path changed");
+    }
+    let backup_path = destination.absolute.join(&backup);
+    if let Err(error) = trash_item(&backup_path) {
+        return rollback_replacement(
+            destination,
+            target,
+            &backup,
+            &format!("failed to move replaced item to trash: {error}"),
+        );
+    }
+    Ok(())
+}
+
+fn rollback_replacement(
+    destination: &MutationParent,
+    target: &OsStr,
+    backup: &OsStr,
+    reason: &str,
+) -> io::Result<()> {
+    remove_entry(&destination.dir, target).map_err(|cleanup_error| {
+        io::Error::other(format!(
+            "{reason}; failed to remove incomplete replacement: {cleanup_error}"
+        ))
+    })?;
+    secure_rename_noreplace(&destination.dir, backup, &destination.dir, target).map_err(
+        |restore_error| io::Error::other(format!("{reason}; restore failed: {restore_error}")),
+    )?;
+    Err(io::Error::other(format!("{reason}; original restored")))
+}
+
+fn remove_entry(dir: &Dir, name: &OsStr) -> io::Result<()> {
+    let metadata = dir.symlink_metadata(name)?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        make_directory_tree_writable(dir, name)?;
+        dir.remove_dir_all(name)
+    } else {
+        #[cfg(windows)]
+        make_file_writable(dir, name)?;
+        dir.remove_file(name)
+    }
+}
+
+fn make_directory_tree_writable(dir: &Dir, name: &OsStr) -> io::Result<()> {
+    let mut permissions = dir.symlink_metadata(name)?.permissions();
+    #[cfg(unix)]
+    {
+        use cap_std::fs::PermissionsExt;
+        permissions.set_mode(permissions.mode() | 0o700);
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(false);
+    dir.set_permissions(name, permissions)?;
+
+    let child = dir.open_dir(name)?;
+    let names = child
+        .entries()?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<io::Result<Vec<_>>>()?;
+    for child_name in names {
+        let metadata = child.symlink_metadata(&child_name)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            make_directory_tree_writable(&child, &child_name)?;
+        } else {
+            #[cfg(windows)]
+            make_file_writable(&child, &child_name)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn make_file_writable(dir: &Dir, name: &OsStr) -> io::Result<()> {
+    let mut permissions = dir.symlink_metadata(name)?.permissions();
+    permissions.set_readonly(false);
+    dir.set_permissions(name, permissions)
+}
+
+fn unique_hidden_name(dir: &Dir, prefix: &str) -> io::Result<OsString> {
+    for _ in 0..1_000 {
+        let candidate = OsString::from(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            COPY_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        match dir.symlink_metadata(&candidate) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(candidate),
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a temporary copy name",
+    ))
+}
+
+fn keep_both_name(original: &OsStr, index: u32) -> OsString {
+    let mut name = original.to_os_string();
+    if index == 1 {
+        name.push(" copy");
+    } else {
+        name.push(format!(" copy {index}"));
+    }
+    name
 }
 
 fn verify_mutation_trust(trust: &WorkspaceTrustStore) -> Result<(), String> {
@@ -2290,6 +2601,213 @@ u UU N... 100644 100644 100644 100644 a b c conflict\0\
         assert!(!outside.join("created").exists());
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn copy_file_supports_no_replace_and_stable_keep_both_names() {
+        let root = temp_dir("copy-file");
+        let (store, state) = trusted_store(&root, "copy-file-state");
+        fs::write(root.join("source.txt"), b"source").unwrap();
+        fs::create_dir(root.join("destination")).unwrap();
+
+        perform_mutation(
+            &root,
+            Some(&store),
+            SidebarMutation::Copy {
+                source: root.join("source.txt"),
+                destination_parent: root.join("destination"),
+                mode: SidebarCopyMode::NoReplace,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(root.join("destination/source.txt")).unwrap(),
+            b"source"
+        );
+        let error = perform_mutation(
+            &root,
+            Some(&store),
+            SidebarMutation::Copy {
+                source: root.join("source.txt"),
+                destination_parent: root.join("destination"),
+                mode: SidebarCopyMode::NoReplace,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("already exists"));
+
+        perform_mutation(
+            &root,
+            Some(&store),
+            SidebarMutation::Copy {
+                source: root.join("source.txt"),
+                destination_parent: root.join("destination"),
+                mode: SidebarCopyMode::KeepBoth,
+            },
+        )
+        .unwrap();
+        perform_mutation(
+            &root,
+            Some(&store),
+            SidebarMutation::Copy {
+                source: root.join("source.txt"),
+                destination_parent: root.join("destination"),
+                mode: SidebarCopyMode::KeepBoth,
+            },
+        )
+        .unwrap();
+        assert!(root.join("destination/source.txt copy").is_file());
+        assert!(root.join("destination/source.txt copy 2").is_file());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_copy_preserves_symlinks_without_following_targets() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("copy-directory");
+        let outside = temp_dir("copy-directory-outside");
+        let (store, state) = trusted_store(&root, "copy-directory-state");
+        fs::create_dir_all(root.join("source/nested")).unwrap();
+        fs::write(root.join("source/nested/file"), b"inside").unwrap();
+        fs::write(outside.join("outside"), b"outside").unwrap();
+        symlink(outside.join("outside"), root.join("source/link")).unwrap();
+        fs::create_dir(root.join("destination")).unwrap();
+
+        perform_mutation(
+            &root,
+            Some(&store),
+            SidebarMutation::Copy {
+                source: root.join("source"),
+                destination_parent: root.join("destination"),
+                mode: SidebarCopyMode::NoReplace,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(root.join("destination/source/nested/file")).unwrap(),
+            b"inside"
+        );
+        assert!(
+            fs::symlink_metadata(root.join("destination/source/link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(outside.join("outside")).unwrap(), b"outside");
+
+        let error = perform_mutation(
+            &root,
+            Some(&store),
+            SidebarMutation::Copy {
+                source: root.join("source"),
+                destination_parent: root.join("source/nested"),
+                mode: SidebarCopyMode::NoReplace,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot be copied into itself"));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn replace_rolls_back_when_trash_fails() {
+        let root = temp_dir("copy-replace-rollback");
+        fs::write(root.join("source"), b"new").unwrap();
+        fs::create_dir(root.join("destination")).unwrap();
+        fs::write(root.join("destination/source"), b"old").unwrap();
+        let root_dir = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+        let source = open_mutation_leaf(&root, &root_dir, &root.join("source")).unwrap();
+        let destination =
+            open_mutation_parent(&root, &root_dir, &root.join("destination")).unwrap();
+        let temporary = unique_hidden_name(&destination.dir, ".ami-code-copy").unwrap();
+        copy_entry(
+            &source.parent.dir,
+            &source.name,
+            &destination.dir,
+            &temporary,
+        )
+        .unwrap();
+
+        let error = replace_copy_with_trash(
+            &root,
+            &root_dir,
+            &destination,
+            &temporary,
+            OsStr::new("source"),
+            |_| Err(io::Error::other("trash unavailable")),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("original restored"));
+        assert_eq!(fs::read(root.join("destination/source")).unwrap(), b"old");
+        assert!(!root.join("destination/.ami-code-copy").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_rollback_removes_a_read_only_directory_copy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("copy-replace-readonly");
+        fs::create_dir_all(root.join("source/nested")).unwrap();
+        fs::write(root.join("source/nested/new"), b"new").unwrap();
+        fs::set_permissions(root.join("source"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::create_dir_all(root.join("destination/source")).unwrap();
+        fs::write(root.join("destination/source/old"), b"old").unwrap();
+        let root_dir = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+        let source = open_mutation_leaf(&root, &root_dir, &root.join("source")).unwrap();
+        let destination =
+            open_mutation_parent(&root, &root_dir, &root.join("destination")).unwrap();
+        let temporary = unique_hidden_name(&destination.dir, ".ami-code-copy").unwrap();
+        copy_entry(
+            &source.parent.dir,
+            &source.name,
+            &destination.dir,
+            &temporary,
+        )
+        .unwrap();
+
+        let error = replace_copy_with_trash(
+            &root,
+            &root_dir,
+            &destination,
+            &temporary,
+            OsStr::new("source"),
+            |_| Err(io::Error::other("trash unavailable")),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("original restored"));
+        assert!(root.join("destination/source/old").is_file());
+        assert!(!root.join("destination/source/nested/new").exists());
+        fs::set_permissions(root.join("source"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replace_moves_the_old_target_to_trash_and_publishes_the_copy() {
+        let root = temp_dir("copy-replace");
+        let (store, state) = trusted_store(&root, "copy-replace-state");
+        fs::write(root.join("source"), b"new").unwrap();
+        fs::create_dir(root.join("destination")).unwrap();
+        fs::write(root.join("destination/source"), b"old").unwrap();
+        perform_mutation(
+            &root,
+            Some(&store),
+            SidebarMutation::Copy {
+                source: root.join("source"),
+                destination_parent: root.join("destination"),
+                mode: SidebarCopyMode::Replace,
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read(root.join("destination/source")).unwrap(), b"new");
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(state).unwrap();
     }
 
     #[test]
