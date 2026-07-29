@@ -2,6 +2,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use std::path::Path;
 
 use crate::workspace::WorkspaceTrustState;
 use crate::workspace::sidebar::{EntryKind, GitStatus, SidebarRow};
@@ -44,6 +45,21 @@ pub fn sidebar_trust_hit(chrome: SidebarTrustChrome, row: usize) -> Option<Sideb
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarEditKind {
+    NewFile,
+    NewFolder,
+    Rename,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SidebarEditView<'a> {
+    pub target: &'a Path,
+    pub value: &'a str,
+    pub kind: SidebarEditKind,
+    pub error: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SidebarStyle {
     pub focused_border: Color,
     pub unfocused_border: Color,
@@ -58,15 +74,24 @@ impl Default for SidebarStyle {
     }
 }
 
-pub fn render_sidebar(
-    frame: &mut ratatui::Frame<'_>,
-    area: Rect,
-    rows: &[SidebarRow],
-    trust: SidebarTrustChrome,
-    error: Option<&str>,
-    focused: bool,
-    style: SidebarStyle,
-) {
+pub struct SidebarView<'a> {
+    pub rows: &'a [SidebarRow],
+    pub edit: Option<SidebarEditView<'a>>,
+    pub trust: SidebarTrustChrome,
+    pub error: Option<&'a str>,
+    pub focused: bool,
+    pub style: SidebarStyle,
+}
+
+pub fn render_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, view: SidebarView<'_>) {
+    let SidebarView {
+        rows,
+        edit,
+        trust,
+        error,
+        focused,
+        style,
+    } = view;
     let title = if error.is_some() {
         "  sidebar !"
     } else {
@@ -81,7 +106,20 @@ pub fn render_sidebar(
             style.unfocused_border
         }));
     let mut lines = trust_lines(trust);
-    lines.extend(rows.iter().map(sidebar_line));
+    for row in rows {
+        let rename =
+            edit.filter(|edit| edit.kind == SidebarEditKind::Rename && edit.target == row.path);
+        lines.push(sidebar_line(row, rename.map(|edit| edit.value)));
+        if let Some(edit) = edit
+            && matches!(
+                edit.kind,
+                SidebarEditKind::NewFile | SidebarEditKind::NewFolder
+            )
+            && edit.target == row.path
+        {
+            lines.push(edit_line(row.depth + 1, edit));
+        }
+    }
     if rows.is_empty()
         && let Some(error) = error
     {
@@ -120,14 +158,44 @@ fn trust_lines(chrome: SidebarTrustChrome) -> Vec<Line<'static>> {
     vec![Line::styled(label, Style::default().fg(color))]
 }
 
-fn sidebar_line(row: &SidebarRow) -> Line<'static> {
+fn edit_line(depth: usize, edit: SidebarEditView<'_>) -> Line<'static> {
+    let marker = if edit.kind == SidebarEditKind::NewFolder {
+        "▸ "
+    } else {
+        "  "
+    };
+    let mut spans = vec![
+        Span::raw("  ".repeat(depth)),
+        Span::styled(marker, Style::default().fg(Color::LightBlue)),
+        Span::styled(
+            format!("{}▏", edit.value),
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(error) = edit.error {
+        spans.push(Span::styled(
+            format!(" ! {error}"),
+            Style::default().fg(Color::LightRed),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn sidebar_line(row: &SidebarRow, name_override: Option<&str>) -> Line<'static> {
     let mut spans = Vec::with_capacity(5);
     spans.push(Span::raw("  ".repeat(row.depth)));
     spans.push(Span::styled(
         row_marker(row).to_string(),
         Style::default().fg(marker_color(row)),
     ));
-    spans.push(Span::raw(row.display_name().into_owned()));
+    spans.push(Span::raw(
+        name_override
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| row.display_name().into_owned()),
+    ));
 
     if let Some(kind) = kind_marker(row.kind) {
         spans.push(Span::styled(kind, Style::default().fg(Color::DarkGray)));

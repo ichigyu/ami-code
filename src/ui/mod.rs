@@ -9,8 +9,8 @@ use ratatui::widgets::Paragraph;
 
 pub use context_menu::{ContextMenu, ContextMenuAction, render_context_menu};
 pub use sidebar::{
-    SidebarStyle, SidebarTrustChrome, SidebarTrustTarget, render_sidebar, sidebar_trust_hit,
-    sidebar_trust_rows,
+    SidebarEditKind, SidebarEditView, SidebarStyle, SidebarTrustChrome, SidebarTrustTarget,
+    SidebarView, render_sidebar, sidebar_trust_hit, sidebar_trust_rows,
 };
 pub use terminal::{
     ShellTerminalPaneView, TerminalPaneStyle, render_compact_workbench, render_shell_terminal_pane,
