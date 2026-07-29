@@ -1940,39 +1940,49 @@ impl AppRuntime {
             self.set_status("clipboard source has no file name");
             return;
         };
-        if path_entry_exists(&destination_parent.join(name)) {
-            self.sidebar_paste = Some(SidebarPasteState {
-                source,
-                destination_parent,
-                phase: SidebarPastePhase::Conflict,
-            });
-            self.set_status("paste conflict: K Keep Both, R Replace, Esc Cancel");
-        } else {
-            self.submit_sidebar_copy(source, destination_parent, SidebarCopyMode::NoReplace);
+        match path_entry_exists(&destination_parent.join(name)) {
+            Ok(true) => {
+                self.sidebar_paste = Some(SidebarPasteState {
+                    source,
+                    destination_parent,
+                    phase: SidebarPastePhase::Conflict,
+                });
+                self.set_status("paste conflict: K Keep Both, R Replace, Esc Cancel");
+            }
+            Ok(false) => {
+                self.submit_sidebar_copy(source, destination_parent, SidebarCopyMode::NoReplace);
+            }
+            Err(error) => self.set_status(format!("failed to inspect paste destination: {error}")),
         }
     }
 
     fn handle_sidebar_paste_key(&mut self, key: KeyEvent) {
-        let Some(paste) = self.sidebar_paste.clone() else {
+        let Some(phase) = self.sidebar_paste.as_ref().map(|paste| paste.phase) else {
             return;
         };
-        match (paste.phase, key.code) {
-            (SidebarPastePhase::Conflict, KeyCode::Char('k' | 'K')) => self.submit_sidebar_copy(
-                paste.source,
-                paste.destination_parent,
-                SidebarCopyMode::KeepBoth,
-            ),
+        match (phase, key.code) {
+            (SidebarPastePhase::Conflict, KeyCode::Char('k' | 'K')) => {
+                let paste = self.sidebar_paste.as_ref().expect("paste state checked");
+                self.submit_sidebar_copy(
+                    paste.source.clone(),
+                    paste.destination_parent.clone(),
+                    SidebarCopyMode::KeepBoth,
+                );
+            }
             (SidebarPastePhase::Conflict, KeyCode::Char('r' | 'R')) => {
                 if let Some(state) = &mut self.sidebar_paste {
                     state.phase = SidebarPastePhase::ConfirmReplace;
                 }
                 self.set_status("replace existing item? Enter confirm, Esc cancel");
             }
-            (SidebarPastePhase::ConfirmReplace, KeyCode::Enter) => self.submit_sidebar_copy(
-                paste.source,
-                paste.destination_parent,
-                SidebarCopyMode::Replace,
-            ),
+            (SidebarPastePhase::ConfirmReplace, KeyCode::Enter) => {
+                let paste = self.sidebar_paste.as_ref().expect("paste state checked");
+                self.submit_sidebar_copy(
+                    paste.source.clone(),
+                    paste.destination_parent.clone(),
+                    SidebarCopyMode::Replace,
+                );
+            }
             (_, KeyCode::Esc) => {
                 self.sidebar_paste = None;
                 self.status = None;
@@ -2507,10 +2517,11 @@ fn sidebar_tree_viewport_rows(area: Rect, trust: SidebarTrustChrome) -> usize {
     sidebar_viewport_rows(area).saturating_sub(sidebar_trust_rows(trust))
 }
 
-fn path_entry_exists(path: &std::path::Path) -> bool {
+fn path_entry_exists(path: &std::path::Path) -> std::io::Result<bool> {
     match std::fs::symlink_metadata(path) {
-        Ok(_) => true,
-        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -3047,8 +3058,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let link = root.join("dangling");
         symlink(root.join("missing"), &link).unwrap();
-        assert!(path_entry_exists(&link));
-        assert!(!path_entry_exists(&root.join("absent")));
+        assert!(path_entry_exists(&link).unwrap());
+        assert!(!path_entry_exists(&root.join("absent")).unwrap());
         std::fs::remove_dir_all(root).unwrap();
     }
 
