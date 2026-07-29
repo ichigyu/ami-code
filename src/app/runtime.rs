@@ -35,7 +35,7 @@ use crate::workbench::{
     MIN_TERMINAL_WIDTH, MouseTarget, PaneId, ShellTabId, ShellTabTarget, WorkbenchLayout,
     WorkbenchLayoutConfig, WorkbenchState, hit_test, shell_tab_hit_test,
 };
-use crate::workspace::sidebar::{Sidebar, SidebarActivation, SidebarMutation};
+use crate::workspace::sidebar::{Sidebar, SidebarActivation, SidebarCopyMode, SidebarMutation};
 use crate::workspace::{Workspace, WorkspaceTrustState, WorkspaceTrustStore};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
@@ -101,6 +101,20 @@ struct SidebarEditState {
     value: String,
     error: Option<String>,
     pending: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarPastePhase {
+    Conflict,
+    ConfirmReplace,
+    Pending,
+}
+
+#[derive(Debug, Clone)]
+struct SidebarPasteState {
+    source: std::path::PathBuf,
+    destination_parent: std::path::PathBuf,
+    phase: SidebarPastePhase,
 }
 
 #[derive(Debug, Clone)]
@@ -793,6 +807,8 @@ struct AppRuntime {
     context_menu: Option<ContextMenuState>,
     sidebar_edit: Option<SidebarEditState>,
     sidebar_delete: Option<SidebarDeleteState>,
+    sidebar_file_clipboard: Option<std::path::PathBuf>,
+    sidebar_paste: Option<SidebarPasteState>,
     layout_store: Option<LayoutStore>,
     trust_store: Option<WorkspaceTrustStore>,
     trust_state: WorkspaceTrustState,
@@ -899,6 +915,8 @@ impl AppRuntime {
             context_menu: None,
             sidebar_edit: None,
             sidebar_delete: None,
+            sidebar_file_clipboard: None,
+            sidebar_paste: None,
             layout_store,
             trust_store,
             trust_state,
@@ -924,6 +942,7 @@ impl AppRuntime {
                 Ok(()) => {
                     self.sidebar_edit = None;
                     self.sidebar_delete = None;
+                    self.sidebar_paste = None;
                     self.status = None;
                 }
                 Err(error) => {
@@ -933,6 +952,9 @@ impl AppRuntime {
                     }
                     if self.sidebar_delete.is_some() {
                         self.sidebar_delete = None;
+                    }
+                    if self.sidebar_paste.is_some() {
+                        self.sidebar_paste = None;
                     }
                     self.set_status(error);
                 }
@@ -1193,6 +1215,10 @@ impl AppRuntime {
                     self.shutdown();
                     return Ok(false);
                 }
+                if self.sidebar_paste.is_some() {
+                    self.handle_sidebar_paste_key(key);
+                    return Ok(true);
+                }
                 if self.sidebar_delete.is_some() {
                     self.handle_sidebar_delete_key(key);
                     return Ok(true);
@@ -1246,6 +1272,9 @@ impl AppRuntime {
                 }
             }
             Event::Paste(contents) => {
+                if self.sidebar_paste.is_some() {
+                    return Ok(true);
+                }
                 if let Some(edit) = &mut self.sidebar_edit {
                     if !edit.pending {
                         edit.value.push_str(&contents);
@@ -1306,10 +1335,15 @@ impl AppRuntime {
                 .sidebar_delete
                 .as_ref()
                 .is_some_and(|delete| delete.pending)
+            || self
+                .sidebar_paste
+                .as_ref()
+                .is_some_and(|paste| paste.phase == SidebarPastePhase::Pending)
         {
             return Ok(());
         }
         let clear_modal_status = self.sidebar_delete.is_some()
+            || self.sidebar_paste.is_some()
             || self
                 .sidebar_edit
                 .as_ref()
@@ -1319,6 +1353,9 @@ impl AppRuntime {
         }
         if self.sidebar_delete.is_some() {
             self.sidebar_delete = None;
+        }
+        if self.sidebar_paste.is_some() {
+            self.sidebar_paste = None;
         }
         if clear_modal_status {
             self.status = None;
@@ -1332,6 +1369,12 @@ impl AppRuntime {
             if event.kind == MouseEventKind::Down(MouseButton::Left) {
                 self.context_menu = None;
                 match context.menu.action_at(event.column, event.row) {
+                    Some(ContextMenuAction::Copy) if context.sidebar_target.is_some() => {
+                        self.begin_sidebar_action(&context, ContextMenuAction::Copy);
+                    }
+                    Some(ContextMenuAction::Paste) if context.sidebar_target.is_some() => {
+                        self.begin_sidebar_action(&context, ContextMenuAction::Paste);
+                    }
                     Some(ContextMenuAction::Copy) => self.copy_selection(),
                     Some(ContextMenuAction::Paste) => {
                         self.workbench.focus_pane(context.pane);
@@ -1407,6 +1450,15 @@ impl AppRuntime {
                             .as_ref()
                             .is_some_and(|sidebar| target != sidebar.root())
                         && kind != Some(crate::workspace::sidebar::EntryKind::Deleted);
+                    let copy_enabled = direct_target
+                        && self
+                            .sidebar
+                            .as_ref()
+                            .is_some_and(|sidebar| target != sidebar.root())
+                        && kind != Some(crate::workspace::sidebar::EntryKind::Deleted);
+                    let paste_enabled = trusted
+                        && self.sidebar_file_clipboard.is_some()
+                        && kind != Some(crate::workspace::sidebar::EntryKind::SymlinkDirectory);
                     self.context_menu = Some(ContextMenuState {
                         menu: ContextMenu::sidebar(
                             self.viewport_area,
@@ -1414,6 +1466,8 @@ impl AppRuntime {
                             event.row,
                             create_enabled,
                             item_enabled,
+                            copy_enabled,
+                            paste_enabled,
                         ),
                         pane: PaneId::Sidebar,
                         sidebar_target: Some(target),
@@ -1775,6 +1829,11 @@ impl AppRuntime {
                     pending: false,
                 });
             }
+            ContextMenuAction::Copy if context.direct_target => {
+                self.sidebar_file_clipboard = Some(target.clone());
+                self.set_status(format!("copied {}", target.display()));
+            }
+            ContextMenuAction::Paste => self.begin_sidebar_paste(target),
             ContextMenuAction::Delete if context.direct_target => {
                 self.set_status(format!(
                     "move {} to trash? Enter confirm, Esc cancel",
@@ -1857,6 +1916,108 @@ impl AppRuntime {
                 }
                 self.set_status(error);
             }
+        }
+    }
+
+    fn begin_sidebar_paste(&mut self, target: std::path::PathBuf) {
+        let Some(source) = self.sidebar_file_clipboard.clone() else {
+            return;
+        };
+        let destination_parent = self
+            .sidebar
+            .as_ref()
+            .and_then(|sidebar| {
+                sidebar
+                    .entry_kind(&target)
+                    .filter(|kind| kind.is_directory())
+                    .map(|_| target.clone())
+            })
+            .or_else(|| target.parent().map(std::path::Path::to_path_buf));
+        let Some(destination_parent) = destination_parent else {
+            return;
+        };
+        let Some(name) = source.file_name() else {
+            self.set_status("clipboard source has no file name");
+            return;
+        };
+        match path_entry_exists(&destination_parent.join(name)) {
+            Ok(true) => {
+                self.sidebar_paste = Some(SidebarPasteState {
+                    source,
+                    destination_parent,
+                    phase: SidebarPastePhase::Conflict,
+                });
+                self.set_status("paste conflict: K Keep Both, R Replace, Esc Cancel");
+            }
+            Ok(false) => {
+                self.submit_sidebar_copy(source, destination_parent, SidebarCopyMode::NoReplace);
+            }
+            Err(error) => self.set_status(format!("failed to inspect paste destination: {error}")),
+        }
+    }
+
+    fn handle_sidebar_paste_key(&mut self, key: KeyEvent) {
+        let Some(phase) = self.sidebar_paste.as_ref().map(|paste| paste.phase) else {
+            return;
+        };
+        match (phase, key.code) {
+            (SidebarPastePhase::Conflict, KeyCode::Char('k' | 'K')) => {
+                let paste = self.sidebar_paste.as_ref().expect("paste state checked");
+                self.submit_sidebar_copy(
+                    paste.source.clone(),
+                    paste.destination_parent.clone(),
+                    SidebarCopyMode::KeepBoth,
+                );
+            }
+            (SidebarPastePhase::Conflict, KeyCode::Char('r' | 'R')) => {
+                if let Some(state) = &mut self.sidebar_paste {
+                    state.phase = SidebarPastePhase::ConfirmReplace;
+                }
+                self.set_status("replace existing item? Enter confirm, Esc cancel");
+            }
+            (SidebarPastePhase::ConfirmReplace, KeyCode::Enter) => {
+                let paste = self.sidebar_paste.as_ref().expect("paste state checked");
+                self.submit_sidebar_copy(
+                    paste.source.clone(),
+                    paste.destination_parent.clone(),
+                    SidebarCopyMode::Replace,
+                );
+            }
+            (_, KeyCode::Esc) => {
+                self.sidebar_paste = None;
+                self.status = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn submit_sidebar_copy(
+        &mut self,
+        source: std::path::PathBuf,
+        destination_parent: std::path::PathBuf,
+        mode: SidebarCopyMode,
+    ) {
+        let result = self
+            .sidebar
+            .as_mut()
+            .ok_or_else(|| "sidebar is unavailable".to_owned())
+            .and_then(|sidebar| {
+                sidebar.request_mutation(SidebarMutation::Copy {
+                    source: source.clone(),
+                    destination_parent: destination_parent.clone(),
+                    mode,
+                })
+            });
+        match result {
+            Ok(()) => {
+                self.sidebar_paste = Some(SidebarPasteState {
+                    source,
+                    destination_parent,
+                    phase: SidebarPastePhase::Pending,
+                });
+                self.set_status("copying sidebar item...");
+            }
+            Err(error) => self.set_status(error),
         }
     }
 
@@ -2354,6 +2515,14 @@ fn sidebar_viewport_rows(area: Rect) -> usize {
 
 fn sidebar_tree_viewport_rows(area: Rect, trust: SidebarTrustChrome) -> usize {
     sidebar_viewport_rows(area).saturating_sub(sidebar_trust_rows(trust))
+}
+
+fn path_entry_exists(path: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn is_sidebar_double_click(
@@ -2876,6 +3045,22 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_counts_as_a_paste_conflict() {
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("ami-runtime-paste-conflict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let link = root.join("dangling");
+        symlink(root.join("missing"), &link).unwrap();
+        assert!(path_entry_exists(&link).unwrap());
+        assert!(!path_entry_exists(&root.join("absent")).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
